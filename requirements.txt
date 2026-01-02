@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+psycopg2-binary
+qdrant-client
+sentence-transformers
+bcrypt
+PyJWT
+httpx
