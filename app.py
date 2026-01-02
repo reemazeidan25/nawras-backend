@@ -17,7 +17,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SUPER_SECRET")
 JWT_ALG = "HS256"
 JWT_EXPIRES_DAYS = 14
 
-# لازم يكون دومين حقيقي بالإنتاج
+
 FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN", "") or "").strip()
 
 ENV = (os.getenv("ENV", "production") or "production").strip().lower()
@@ -91,16 +91,17 @@ def make_jwt(user_id_uuid: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def set_auth_cookie(resp: Response, token: str):
-    # ✅ للإنتاج: secure=True + samesite="none"
     resp.set_cookie(
         key="nawras_token",
         value=token,
         httponly=True,
-        secure=IS_PROD,
-        samesite="none" if IS_PROD else "lax",
+        secure=True,
+        samesite="none",
+        domain=".onrender.com",  # ⭐⭐⭐ هاي الإضافة
         max_age=JWT_EXPIRES_DAYS * 24 * 3600,
         path="/",
     )
+
 
 def get_user_from_cookie(req: Request) -> str:
     token = req.cookies.get("nawras_token")
