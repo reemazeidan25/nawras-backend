@@ -13,11 +13,11 @@ load_dotenv()
 SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip()
 SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY", "") or "").strip()
 
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SUPER_SECRET")
+JWT_SECRET = (os.getenv("JWT_SECRET", "CHANGE_ME_SUPER_SECRET") or "CHANGE_ME_SUPER_SECRET").strip()
 JWT_ALG = "HS256"
 JWT_EXPIRES_DAYS = 14
 
-
+# اختياري: دومين production إذا عندك (مثلاً https://nawras-frontend.vercel.app)
 FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN", "") or "").strip()
 
 ENV = (os.getenv("ENV", "production") or "production").strip().lower()
@@ -29,37 +29,36 @@ if not SUPABASE_URL or not SUPABASE_URL.startswith("https://"):
 if not SUPABASE_SERVICE_KEY or not SUPABASE_SERVICE_KEY.startswith("ey"):
     raise RuntimeError("SUPABASE_SERVICE_KEY is missing/invalid. Put service_role key in .env")
 
-if not FRONTEND_ORIGIN or FRONTEND_ORIGIN.startswith("http://localhost") or "127.0.0.1" in FRONTEND_ORIGIN:
-    raise RuntimeError("FRONTEND_ORIGIN is missing/invalid (must be a real domain, not localhost). Put it in .env")
-
 REST_BASE = f"{SUPABASE_URL}/rest/v1"
 
 app = FastAPI()
 
-
-from fastapi.middleware.cors import CORSMiddleware
+# ====== CORS (FIX preflight for Vercel previews) ======
+# IMPORTANT:
+# - With allow_credentials=True you MUST NOT use wildcard allow_origins=["*"]
+# - Vercel preview domains change, so we allow all *.vercel.app via regex.
+# - Optional: include FRONTEND_ORIGIN in allow_origins if you want a stable prod domain too.
+allowed_origins = []
+if FRONTEND_ORIGIN:
+    allowed_origins.append(FRONTEND_ORIGIN)
+# للتطوير المحلي فقط (اختياري)
+allowed_origins.append("http://localhost:3000")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://nawras-frontend.vercel.app",
-    ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=allowed_origins,                # دومين ثابت إذا موجود + localhost
+    allow_origin_regex=r"https://.*\.vercel\.app",# كل preview/prod على vercel
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-
-# ====== ONE SHARED HTTP CLIENT (FAST) ======
+# ====== ONE SHARED HTTP CLIENT ======
 sb_client: httpx.AsyncClient | None = None
 
 @app.on_event("startup")
 async def startup_event():
     global sb_client
-    # ❌ لا تستخدم http2=True (يطلب h2)
     sb_client = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0))
 
 @app.on_event("shutdown")
@@ -99,17 +98,19 @@ def make_jwt(user_id_uuid: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def set_auth_cookie(resp: Response, token: str):
+    # لا تضعي domain (Render + متصفحات + cross-site أفضل بدونها)
     resp.set_cookie(
         key="nawras_token",
         value=token,
         httponly=True,
         secure=True,
         samesite="none",
-        domain=".onrender.com",  # ⭐⭐⭐ هاي الإضافة
         max_age=JWT_EXPIRES_DAYS * 24 * 3600,
         path="/",
     )
 
+def clear_auth_cookie(resp: Response):
+    resp.delete_cookie(key="nawras_token", path="/")
 
 def get_user_from_cookie(req: Request) -> str:
     token = req.cookies.get("nawras_token")
@@ -125,7 +126,7 @@ def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 def send_email_code(email: str, code: str):
-    # مؤقتاً اطبعيه بالكونسول (بدك خدمة ايميل لاحقاً)
+    # للتجربة: اطبعيه في logs
     print(f"✅ Verification code for {email}: {code}")
 
 def sb_headers(return_representation: bool = False):
@@ -197,7 +198,6 @@ async def register(payload: RegisterIn):
     if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 chars")
 
-    # ملاحظة: rounds=10 أسرع للتجربة، على الإنتاج خليها 12+
     pw_hash = bcrypt.hashpw(
         payload.password.encode("utf-8"),
         bcrypt.gensalt(rounds=10 if not IS_PROD else 12)
@@ -286,6 +286,7 @@ async def login(payload: LoginIn, resp: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if u.get("is_verified") is not True:
+        # مهم: خلي الديتيل dict زي ما فرونتك بتقرأ
         raise HTTPException(status_code=403, detail={"code": "EMAIL_NOT_VERIFIED", "message": "Email not verified"})
 
     token = make_jwt(u["id_uuid"])
@@ -294,7 +295,7 @@ async def login(payload: LoginIn, resp: Response):
 
 @app.post("/api/logout")
 def logout(resp: Response):
-    resp.delete_cookie("nawras_token", path="/")
+    clear_auth_cookie(resp)
     return {"ok": True}
 
 @app.get("/api/me")
