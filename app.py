@@ -33,21 +33,16 @@ REST_BASE = f"{SUPABASE_URL}/rest/v1"
 
 app = FastAPI()
 
-# ====== CORS (FIX preflight for Vercel previews) ======
-# IMPORTANT:
-# - With allow_credentials=True you MUST NOT use wildcard allow_origins=["*"]
-# - Vercel preview domains change, so we allow all *.vercel.app via regex.
-# - Optional: include FRONTEND_ORIGIN in allow_origins if you want a stable prod domain too.
+# ====== CORS ======
 allowed_origins = []
 if FRONTEND_ORIGIN:
     allowed_origins.append(FRONTEND_ORIGIN)
-# للتطوير المحلي فقط (اختياري)
 allowed_origins.append("http://localhost:3000")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,                # دومين ثابت إذا موجود + localhost
-    allow_origin_regex=r"https://.*\.vercel\.app",# كل preview/prod على vercel
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,6 +86,14 @@ class VerifyCodeIn(BaseModel):
     email: EmailStr
     code: str
 
+class ResetRequestIn(BaseModel):
+    email: EmailStr
+
+class ResetPasswordIn(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
 # ====== Helpers ======
 def make_jwt(user_id_uuid: str) -> str:
     exp = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRES_DAYS)
@@ -98,7 +101,6 @@ def make_jwt(user_id_uuid: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def set_auth_cookie(resp: Response, token: str):
-    # لا تضعي domain (Render + متصفحات + cross-site أفضل بدونها)
     resp.set_cookie(
         key="nawras_token",
         value=token,
@@ -126,8 +128,12 @@ def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 def send_email_code(email: str, code: str):
-    # للتجربة: اطبعيه في logs
+    # مؤقتًا للتجربة: بيطلع بالكـ logs في Render
     print(f"✅ Verification code for {email}: {code}")
+
+def send_reset_code(email: str, code: str):
+    # مؤقتًا للتجربة: بيطلع بالكـ logs في Render
+    print(f"✅ Password reset code for {email}: {code}")
 
 def sb_headers(return_representation: bool = False):
     h = {
@@ -191,8 +197,14 @@ def health():
 async def register(payload: RegisterIn):
     email = payload.email.strip().lower()
 
-    existing = await sb_get("users", {"select": "id_uuid", "email": f"eq.{email}", "limit": 1})
+    existing = await sb_get("users", {"select": "id_uuid,is_verified", "email": f"eq.{email}", "limit": 1})
     if existing:
+        # لو موجود بس غير مفعل → رجّعي كود خاص للفرونت
+        if existing[0].get("is_verified") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "EMAIL_EXISTS_NOT_VERIFIED", "message": "Email exists but not verified"},
+            )
         raise HTTPException(status_code=409, detail="Email already exists")
 
     if len(payload.password) < 8:
@@ -271,6 +283,63 @@ async def verify_email_code(payload: VerifyCodeIn):
     await sb_delete("email_verifications", {"email": f"eq.{email}"})
     return {"ok": True}
 
+# ====== Forgot/Reset Password ======
+@app.post("/api/auth/request_password_reset")
+async def request_password_reset(payload: ResetRequestIn):
+    email = payload.email.strip().lower()
+
+    user = await sb_get("users", {"select": "id_uuid", "email": f"eq.{email}", "limit": 1})
+    # لا نكشف إذا موجود أو لا
+    if not user:
+        return {"ok": True}
+
+    code = f"{secrets.randbelow(10**6):06d}"
+    code_h = hash_code(code)
+    expires = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    await sb_delete("password_resets", {"email": f"eq.{email}"})
+
+    await sb_post("password_resets", {
+        "email": email,
+        "code_hash": code_h,
+        "expires_at": expires.isoformat(),
+    }, return_rep=False)
+
+    send_reset_code(email, code)
+    return {"ok": True}
+
+@app.post("/api/auth/reset_password")
+async def reset_password(payload: ResetPasswordIn):
+    email = payload.email.strip().lower()
+    code = payload.code.strip()
+    new_password = payload.new_password
+
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 chars")
+
+    row = await sb_get("password_resets", {"select": "*", "email": f"eq.{email}", "limit": 1})
+    if not row:
+        raise HTTPException(status_code=400, detail="No reset code requested")
+
+    rec = row[0]
+    expires_at_str = str(rec["expires_at"]).replace("Z", "+00:00")
+    expires_at = datetime.fromisoformat(expires_at_str)
+
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Code expired")
+
+    if rec["code_hash"] != hash_code(code):
+        raise HTTPException(status_code=400, detail="Invalid code")
+
+    pw_hash = bcrypt.hashpw(
+        new_password.encode("utf-8"),
+        bcrypt.gensalt(rounds=10 if not IS_PROD else 12)
+    ).decode("utf-8")
+
+    await sb_patch("users", {"password_hash": pw_hash}, {"email": f"eq.{email}"})
+    await sb_delete("password_resets", {"email": f"eq.{email}"})
+    return {"ok": True}
+
 @app.post("/api/login")
 async def login(payload: LoginIn, resp: Response):
     email = payload.email.strip().lower()
@@ -286,7 +355,6 @@ async def login(payload: LoginIn, resp: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if u.get("is_verified") is not True:
-        # مهم: خلي الديتيل dict زي ما فرونتك بتقرأ
         raise HTTPException(status_code=403, detail={"code": "EMAIL_NOT_VERIFIED", "message": "Email not verified"})
 
     token = make_jwt(u["id_uuid"])
@@ -304,9 +372,8 @@ async def me(req: Request):
 
     profile = await sb_get(
         "users",
-        {"select": "id_uuid,name,email,grade,school,path,field,is_verified", "id_uuid": f"eq.{user_id}", "limit": 1},
+        {"select": "id_uuid,name,email,grade,school,path,field,is_verified,phone,governorate", "id_uuid": f"eq.{user_id}", "limit": 1},
     )
-
     if not profile:
         raise HTTPException(status_code=404, detail="User not found")
     return profile[0]
