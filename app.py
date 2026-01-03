@@ -7,6 +7,10 @@ import os, bcrypt, jwt, secrets, hashlib, uuid
 import httpx
 from dotenv import load_dotenv
 
+# ✅ Resend
+import resend
+from typing import Optional
+
 load_dotenv()
 
 # ====== CONFIG ======
@@ -17,11 +21,18 @@ JWT_SECRET = (os.getenv("JWT_SECRET", "CHANGE_ME_SUPER_SECRET") or "CHANGE_ME_SU
 JWT_ALG = "HS256"
 JWT_EXPIRES_DAYS = 14
 
-# اختياري: دومين production إذا عندك (مثلاً https://nawras-frontend.vercel.app)
 FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN", "") or "").strip()
 
 ENV = (os.getenv("ENV", "production") or "production").strip().lower()
 IS_PROD = ENV == "production"
+
+# ✅ Resend env
+RESEND_API_KEY = (os.getenv("RESEND_API_KEY", "") or "").strip()
+EMAIL_FROM = (os.getenv("EMAIL_FROM", "") or "").strip()
+EMAIL_REPLY_TO = (os.getenv("EMAIL_REPLY_TO", "") or "").strip()
+
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 if not SUPABASE_URL or not SUPABASE_URL.startswith("https://"):
     raise RuntimeError("SUPABASE_URL is missing/invalid. Put it in .env as https://xxxx.supabase.co")
@@ -127,13 +138,63 @@ def get_user_from_cookie(req: Request) -> str:
 def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
+# ✅ Resend sender
+def send_email(to_email: str, subject: str, html: str, text: Optional[str] = None):
+    if not RESEND_API_KEY or not EMAIL_FROM:
+        # fallback للـ logs
+        print("⚠️ Email not configured. Missing RESEND_API_KEY or EMAIL_FROM.")
+        print(f"TO={to_email} SUBJECT={subject}\n{text or ''}\n{html}")
+        return
+
+    payload = {
+        "from": EMAIL_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+    }
+    if text:
+        payload["text"] = text
+    if EMAIL_REPLY_TO:
+        payload["reply_to"] = EMAIL_REPLY_TO
+
+    try:
+        resend.Emails.send(payload)
+    except Exception as e:
+        print(f"❌ Failed to send email to {to_email}: {e}")
+
 def send_email_code(email: str, code: str):
-    # مؤقتًا للتجربة: بيطلع بالكـ logs في Render
-    print(f"✅ Verification code for {email}: {code}")
+    subject = "Nawras | كود تفعيل الحساب"
+    html = f"""
+    <div style="font-family:Arial,sans-serif; line-height:1.9; direction:rtl; text-align:right">
+      <h2 style="color:#0284c7; margin:0 0 10px">تفعيل حسابك في نَوْرَس</h2>
+      <p>هذا هو <b>كود التفعيل</b> (صالح لمدة 10 دقائق):</p>
+      <div style="font-size:28px; letter-spacing:6px; font-weight:700; padding:12px 16px;
+                  background:#f0f9ff; border:1px solid #bae6fd; display:inline-block; border-radius:12px;">
+        {code}
+      </div>
+      <p style="margin-top:14px; color:#555">إذا لم تطلبي هذا الكود، تجاهلي الرسالة.</p>
+      <p style="font-size:12px; color:#777">Nawras Team</p>
+    </div>
+    """
+    text = f"Nawras verification code: {code} (valid 10 minutes)"
+    send_email(email, subject, html, text)
 
 def send_reset_code(email: str, code: str):
-    # مؤقتًا للتجربة: بيطلع بالكـ logs في Render
-    print(f"✅ Password reset code for {email}: {code}")
+    subject = "Nawras | كود استرجاع كلمة المرور"
+    html = f"""
+    <div style="font-family:Arial,sans-serif; line-height:1.9; direction:rtl; text-align:right">
+      <h2 style="color:#0284c7; margin:0 0 10px">استرجاع كلمة المرور</h2>
+      <p>هذا هو <b>كود الاسترجاع</b> (صالح لمدة 10 دقائق):</p>
+      <div style="font-size:28px; letter-spacing:6px; font-weight:700; padding:12px 16px;
+                  background:#f0f9ff; border:1px solid #bae6fd; display:inline-block; border-radius:12px;">
+        {code}
+      </div>
+      <p style="margin-top:14px; color:#555">إذا لم تطلبي هذا الطلب، تجاهلي الرسالة.</p>
+      <p style="font-size:12px; color:#777">Nawras Team</p>
+    </div>
+    """
+    text = f"Nawras password reset code: {code} (valid 10 minutes)"
+    send_email(email, subject, html, text)
 
 def sb_headers(return_representation: bool = False):
     h = {
@@ -199,7 +260,6 @@ async def register(payload: RegisterIn):
 
     existing = await sb_get("users", {"select": "id_uuid,is_verified", "email": f"eq.{email}", "limit": 1})
     if existing:
-        # لو موجود بس غير مفعل → رجّعي كود خاص للفرونت
         if existing[0].get("is_verified") is not True:
             raise HTTPException(
                 status_code=409,
@@ -241,7 +301,6 @@ async def request_email_code(payload: EmailIn):
     user = await sb_get("users", {"select": "id_uuid,is_verified", "email": f"eq.{email}", "limit": 1})
     if not user:
         return {"ok": True}
-
     if user[0].get("is_verified") is True:
         return {"ok": True}
 
@@ -250,7 +309,6 @@ async def request_email_code(payload: EmailIn):
     expires = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     await sb_delete("email_verifications", {"email": f"eq.{email}"})
-
     await sb_post("email_verifications", {
         "email": email,
         "code_hash": code_h,
@@ -283,13 +341,11 @@ async def verify_email_code(payload: VerifyCodeIn):
     await sb_delete("email_verifications", {"email": f"eq.{email}"})
     return {"ok": True}
 
-# ====== Forgot/Reset Password ======
 @app.post("/api/auth/request_password_reset")
 async def request_password_reset(payload: ResetRequestIn):
     email = payload.email.strip().lower()
 
     user = await sb_get("users", {"select": "id_uuid", "email": f"eq.{email}", "limit": 1})
-    # لا نكشف إذا موجود أو لا
     if not user:
         return {"ok": True}
 
@@ -298,7 +354,6 @@ async def request_password_reset(payload: ResetRequestIn):
     expires = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     await sb_delete("password_resets", {"email": f"eq.{email}"})
-
     await sb_post("password_resets", {
         "email": email,
         "code_hash": code_h,
@@ -327,7 +382,6 @@ async def reset_password(payload: ResetPasswordIn):
 
     if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Code expired")
-
     if rec["code_hash"] != hash_code(code):
         raise HTTPException(status_code=400, detail="Invalid code")
 
@@ -369,10 +423,10 @@ def logout(resp: Response):
 @app.get("/api/me")
 async def me(req: Request):
     user_id = get_user_from_cookie(req)
-
     profile = await sb_get(
         "users",
-        {"select": "id_uuid,name,email,grade,school,path,field,is_verified,phone,governorate", "id_uuid": f"eq.{user_id}", "limit": 1},
+        {"select": "id_uuid,name,email,grade,school,path,field,is_verified,phone,governorate",
+         "id_uuid": f"eq.{user_id}", "limit": 1},
     )
     if not profile:
         raise HTTPException(status_code=404, detail="User not found")

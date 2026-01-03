@@ -8,3 +8,5 @@ bcrypt
 PyJWT
 httpx
 pydantic[email]
+resend==2.4.0
+
