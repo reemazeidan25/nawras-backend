@@ -141,10 +141,10 @@ def hash_code(code: str) -> str:
 # ✅ Resend sender
 def send_email(to_email: str, subject: str, html: str, text: Optional[str] = None):
     if not RESEND_API_KEY or not EMAIL_FROM:
-        # fallback للـ logs
-        print("⚠️ Email not configured. Missing RESEND_API_KEY or EMAIL_FROM.")
-        print(f"TO={to_email} SUBJECT={subject}\n{text or ''}\n{html}")
-        return
+        raise HTTPException(
+            status_code=500,
+            detail="Email not configured: missing RESEND_API_KEY or EMAIL_FROM"
+        )
 
     payload = {
         "from": EMAIL_FROM,
@@ -158,9 +158,12 @@ def send_email(to_email: str, subject: str, html: str, text: Optional[str] = Non
         payload["reply_to"] = EMAIL_REPLY_TO
 
     try:
-        resend.Emails.send(payload)
+        result = resend.Emails.send(payload)
+        print("✅ Resend result:", result)
     except Exception as e:
         print(f"❌ Failed to send email to {to_email}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
+
 
 def send_email_code(email: str, code: str):
     subject = "Nawras | كود تفعيل الحساب"
