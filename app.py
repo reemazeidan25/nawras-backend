@@ -36,14 +36,20 @@ REST_BASE = f"{SUPABASE_URL}/rest/v1"
 
 app = FastAPI()
 
-# ====== CORS (NO LOCALHOST) ======
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://nawras-frontend.vercel.app",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ====== ONE SHARED HTTP CLIENT (FAST) ======
 sb_client: httpx.AsyncClient | None = None
