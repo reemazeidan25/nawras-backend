@@ -1,4 +1,3 @@
-# app.py
 from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -6,10 +5,10 @@ from datetime import datetime, timedelta, timezone
 import os, bcrypt, jwt, secrets, hashlib, uuid
 import httpx
 from dotenv import load_dotenv
+from typing import Optional, Dict, Any
 
 # Resend
 import resend
-from typing import Optional
 
 load_dotenv()
 
@@ -19,7 +18,7 @@ SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY", "") or "").strip()
 
 JWT_SECRET = (os.getenv("JWT_SECRET", "CHANGE_ME_SUPER_SECRET") or "CHANGE_ME_SUPER_SECRET").strip()
 JWT_ALG = "HS256"
-JWT_EXPIRES_DAYS = 14
+JWT_EXPIRES_DAYS = int(os.getenv("JWT_EXPIRES_DAYS", "14") or "14")
 
 FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN", "") or "").strip()
 ENV = (os.getenv("ENV", "production") or "production").strip().lower()
@@ -28,7 +27,7 @@ IS_PROD = ENV == "production"
 # Resend env
 RESEND_API_KEY = (os.getenv("RESEND_API_KEY", "") or "").strip()
 EMAIL_FROM = (os.getenv("EMAIL_FROM", "") or "").strip()
-EMAIL_REPLY_TO = (os.getenv("EMAIL_REPLY_TO", "") or "").strip()  # اختياري
+EMAIL_REPLY_TO = (os.getenv("EMAIL_REPLY_TO", "") or "").strip()
 
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
@@ -44,10 +43,13 @@ REST_BASE = f"{SUPABASE_URL}/rest/v1"
 app = FastAPI()
 
 # ====== CORS ======
+# مهم: صفحة الأسئلة على Vercel غالباً ما بتبعت كوكي، فنعتمد كمان على Bearer Token.
 allowed_origins = []
 if FRONTEND_ORIGIN:
     allowed_origins.append(FRONTEND_ORIGIN)
-allowed_origins.append("http://localhost:3000")
+
+# للـ local
+allowed_origins.extend(["http://localhost:3000", "http://127.0.0.1:3000"])
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,12 +61,12 @@ app.add_middleware(
 )
 
 # ====== ONE SHARED HTTP CLIENT ======
-sb_client: httpx.AsyncClient | None = None
+sb_client: Optional[httpx.AsyncClient] = None
 
 @app.on_event("startup")
 async def startup_event():
     global sb_client
-    sb_client = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0))
+    sb_client = httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=10.0))
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -78,12 +80,12 @@ class RegisterIn(BaseModel):
     name: str
     email: EmailStr
     password: str
-    grade: str | None = None
-    school: str | None = None
-    path: str | None = None
-    field: str | None = None
-    phone: str | None = None
-    governorate: str | None = None
+    grade: Optional[str] = None
+    school: Optional[str] = None
+    path: Optional[str] = None
+    field: Optional[str] = None
+    phone: Optional[str] = None
+    governorate: Optional[str] = None
 
 class LoginIn(BaseModel):
     email: EmailStr
@@ -104,13 +106,12 @@ class ResetPasswordIn(BaseModel):
     code: str
     new_password: str
 
-# ✅ للشات
 class ChatIn(BaseModel):
     user_id: str
     question: str
-    session_id: str | None = None
+    session_id: Optional[str] = None
     log_history: bool = True
-    source: str | None = None
+    source: Optional[str] = None
 
 # ====== Helpers ======
 def require_gmail(email: str):
@@ -140,8 +141,18 @@ def set_auth_cookie(resp: Response, token: str):
 def clear_auth_cookie(resp: Response):
     resp.delete_cookie(key="nawras_token", path="/")
 
-def get_user_from_cookie(req: Request) -> str:
-    token = req.cookies.get("nawras_token")
+def _get_bearer_token(req: Request) -> Optional[str]:
+    auth = req.headers.get("authorization") or req.headers.get("Authorization")
+    if not auth:
+        return None
+    parts = auth.split(" ")
+    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+        return parts[1].strip()
+    return None
+
+def get_user_from_request(req: Request) -> str:
+    # ✅ يدعم cookie أو Bearer token
+    token = req.cookies.get("nawras_token") or _get_bearer_token(req)
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -156,27 +167,17 @@ def hash_code(code: str) -> str:
 # ====== Resend ======
 def send_email(to_email: str, subject: str, html: str, text: Optional[str] = None):
     if not RESEND_API_KEY or not EMAIL_FROM:
-        raise HTTPException(
-            status_code=500,
-            detail="Email not configured: missing RESEND_API_KEY or EMAIL_FROM"
-        )
+        raise HTTPException(status_code=500, detail="Email not configured: missing RESEND_API_KEY or EMAIL_FROM")
 
-    payload = {
-        "from": EMAIL_FROM,
-        "to": [to_email],
-        "subject": subject,
-        "html": html,
-    }
+    payload: Dict[str, Any] = {"from": EMAIL_FROM, "to": [to_email], "subject": subject, "html": html}
     if text:
         payload["text"] = text
     if EMAIL_REPLY_TO:
-        payload["reply_to"] = EMAIL_REPLY_TO  # اختياري
+        payload["reply_to"] = EMAIL_REPLY_TO
 
     try:
-        result = resend.Emails.send(payload)
-        print("✅ Resend result:", result)
+        resend.Emails.send(payload)
     except Exception as e:
-        print(f"❌ Failed to send email to {to_email}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
 
 def send_email_code(email: str, code: str):
@@ -193,8 +194,7 @@ def send_email_code(email: str, code: str):
       <p style="font-size:12px; color:#777">Nawras Team</p>
     </div>
     """
-    text = f"Nawras verification code: {code} (valid 10 minutes)"
-    send_email(email, subject, html, text)
+    send_email(email, subject, html, f"Nawras verification code: {code} (valid 10 minutes)")
 
 def send_reset_code(email: str, code: str):
     subject = "Nawras | كود استرجاع كلمة المرور"
@@ -210,8 +210,7 @@ def send_reset_code(email: str, code: str):
       <p style="font-size:12px; color:#777">Nawras Team</p>
     </div>
     """
-    text = f"Nawras password reset code: {code} (valid 10 minutes)"
-    send_email(email, subject, html, text)
+    send_email(email, subject, html, f"Nawras password reset code: {code} (valid 10 minutes)")
 
 # ====== Supabase REST helpers ======
 def sb_headers(return_representation: bool = False):
@@ -268,6 +267,10 @@ async def sb_delete(table: str, params: dict):
     return True
 
 # ====== Endpoints ======
+@app.get("/")
+def root():
+    return {"ok": True, "service": "nawras-backend"}
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -319,19 +322,16 @@ async def request_email_code(payload: EmailIn):
     require_gmail(email)
 
     user = await sb_get("users", {"select": "id_uuid,is_verified", "email": f"eq.{email}", "limit": 1})
-    if not user:
-        return {"ok": True}
-    if user[0].get("is_verified") is True:
+    if not user or user[0].get("is_verified") is True:
         return {"ok": True}
 
     code = f"{secrets.randbelow(10**6):06d}"
-    code_h = hash_code(code)
     expires = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     await sb_delete("email_verifications", {"email": f"eq.{email}"})
     await sb_post("email_verifications", {
         "email": email,
-        "code_hash": code_h,
+        "code_hash": hash_code(code),
         "expires_at": expires.isoformat(),
     }, return_rep=False)
 
@@ -349,12 +349,9 @@ async def verify_email_code(payload: VerifyCodeIn):
         raise HTTPException(status_code=400, detail="No code requested")
 
     rec = row[0]
-    expires_at_str = str(rec["expires_at"]).replace("Z", "+00:00")
-    expires_at = datetime.fromisoformat(expires_at_str)
-
+    expires_at = datetime.fromisoformat(str(rec["expires_at"]).replace("Z", "+00:00"))
     if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Code expired")
-
     if rec["code_hash"] != hash_code(code):
         raise HTTPException(status_code=400, detail="Invalid code")
 
@@ -372,13 +369,12 @@ async def request_password_reset(payload: ResetRequestIn):
         return {"ok": True}
 
     code = f"{secrets.randbelow(10**6):06d}"
-    code_h = hash_code(code)
     expires = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     await sb_delete("password_resets", {"email": f"eq.{email}"})
     await sb_post("password_resets", {
         "email": email,
-        "code_hash": code_h,
+        "code_hash": hash_code(code),
         "expires_at": expires.isoformat(),
     }, return_rep=False)
 
@@ -390,9 +386,8 @@ async def reset_password(payload: ResetPasswordIn):
     email = payload.email.strip().lower()
     require_gmail(email)
     code = payload.code.strip()
-    new_password = payload.new_password
 
-    if len(new_password) < 8:
+    if len(payload.new_password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 chars")
 
     row = await sb_get("password_resets", {"select": "*", "email": f"eq.{email}", "limit": 1})
@@ -400,16 +395,14 @@ async def reset_password(payload: ResetPasswordIn):
         raise HTTPException(status_code=400, detail="No reset code requested")
 
     rec = row[0]
-    expires_at_str = str(rec["expires_at"]).replace("Z", "+00:00")
-    expires_at = datetime.fromisoformat(expires_at_str)
-
+    expires_at = datetime.fromisoformat(str(rec["expires_at"]).replace("Z", "+00:00"))
     if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Code expired")
     if rec["code_hash"] != hash_code(code):
         raise HTTPException(status_code=400, detail="Invalid code")
 
     pw_hash = bcrypt.hashpw(
-        new_password.encode("utf-8"),
+        payload.new_password.encode("utf-8"),
         bcrypt.gensalt(rounds=12 if IS_PROD else 10)
     ).decode("utf-8")
 
@@ -422,16 +415,12 @@ async def login(payload: LoginIn, resp: Response):
     email = payload.email.strip().lower()
     require_gmail(email)
 
-    user = await sb_get(
-        "users",
-        {"select": "id_uuid,name,email,password_hash,is_verified", "email": f"eq.{email}", "limit": 1},
-    )
+    user = await sb_get("users", {"select": "id_uuid,name,email,password_hash,is_verified", "email": f"eq.{email}", "limit": 1})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     u = user[0]
     stored = (u.get("password_hash") or "").encode("utf-8")
-
     if not stored or not bcrypt.checkpw(payload.password.encode("utf-8"), stored):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
@@ -441,7 +430,14 @@ async def login(payload: LoginIn, resp: Response):
     token = make_jwt(u["id_uuid"])
     set_auth_cookie(resp, token)
 
-    return {"ok": True, "user_id": u["id_uuid"], "name": u.get("name") or "", "email": u.get("email") or ""}
+    # ✅ رجّعي token للفرونت عشان Page الأسئلة تبعت Bearer
+    return {
+        "ok": True,
+        "user_id": u["id_uuid"],
+        "name": u.get("name") or "",
+        "email": u.get("email") or "",
+        "token": token,
+    }
 
 @app.post("/api/logout")
 def logout(resp: Response):
@@ -450,7 +446,7 @@ def logout(resp: Response):
 
 @app.get("/api/me")
 async def me(req: Request):
-    user_id = get_user_from_cookie(req)
+    user_id = get_user_from_request(req)
     profile = await sb_get(
         "users",
         {"select": "id_uuid,name,email,grade,school,path,field,is_verified,phone,governorate",
@@ -461,11 +457,14 @@ async def me(req: Request):
     return profile[0]
 
 # =========================
-# ✅ Chat + History (needed by /questions page)
+# Chat + History (Protected)
 # =========================
-
 @app.get("/api/history_db")
-async def history_db(user_id: str, session_id: str | None = None):
+async def history_db(req: Request, user_id: str, session_id: Optional[str] = None):
+    auth_user = get_user_from_request(req)
+    if auth_user != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     params = {
         "select": "id,role,content,ts,session_id,source",
         "user_id": f"eq.{user_id}",
@@ -475,22 +474,28 @@ async def history_db(user_id: str, session_id: str | None = None):
     if session_id:
         params["session_id"] = f"eq.{session_id}"
 
-    rows = await sb_get("wizard_sessions", params)
-    return rows
+    return await sb_get("wizard_sessions", params)
 
 @app.post("/api/chat")
-async def chat(payload: ChatIn):
+async def chat(req: Request, payload: ChatIn):
+    auth_user = get_user_from_request(req)
+    if auth_user != payload.user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     sid = payload.session_id or str(uuid.uuid4())
 
-    # ✅ هنا لاحقاً تربطي RAG الحقيقي
+    # ✅ مؤقتاً جواب بسيط
     answer = f"وصلني سؤالك: {payload.question}\n(جاري ربط الإجابة الذكية لاحقاً)."
 
     if payload.log_history:
+        now_iso = datetime.now(timezone.utc).isoformat()
+
         await sb_post("wizard_sessions", {
             "user_id": payload.user_id,
             "session_id": sid,
             "role": "user",
             "content": payload.question,
+            "ts": now_iso,
             "source": payload.source or "questions_page",
         }, return_rep=False)
 
@@ -499,6 +504,7 @@ async def chat(payload: ChatIn):
             "session_id": sid,
             "role": "assistant",
             "content": answer,
+            "ts": now_iso,
             "source": payload.source or "questions_page",
         }, return_rep=False)
 
