@@ -28,7 +28,7 @@ IS_PROD = ENV == "production"
 # Resend env
 RESEND_API_KEY = (os.getenv("RESEND_API_KEY", "") or "").strip()
 EMAIL_FROM = (os.getenv("EMAIL_FROM", "") or "").strip()
-EMAIL_REPLY_TO = (os.getenv("EMAIL_REPLY_TO", "") or "").strip()
+EMAIL_REPLY_TO = (os.getenv("EMAIL_REPLY_TO", "") or "").strip()  # اختياري
 
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
@@ -104,6 +104,14 @@ class ResetPasswordIn(BaseModel):
     code: str
     new_password: str
 
+# ✅ للشات
+class ChatIn(BaseModel):
+    user_id: str
+    question: str
+    session_id: str | None = None
+    log_history: bool = True
+    source: str | None = None
+
 # ====== Helpers ======
 def require_gmail(email: str):
     e = (email or "").strip().lower()
@@ -119,7 +127,6 @@ def make_jwt(user_id_uuid: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def set_auth_cookie(resp: Response, token: str):
-    # IMPORTANT: secure + samesite rules differ between local/prod
     resp.set_cookie(
         key="nawras_token",
         value=token,
@@ -146,7 +153,7 @@ def get_user_from_cookie(req: Request) -> str:
 def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
-# Resend senders
+# ====== Resend ======
 def send_email(to_email: str, subject: str, html: str, text: Optional[str] = None):
     if not RESEND_API_KEY or not EMAIL_FROM:
         raise HTTPException(
@@ -156,14 +163,14 @@ def send_email(to_email: str, subject: str, html: str, text: Optional[str] = Non
 
     payload = {
         "from": EMAIL_FROM,
-        "to": [to_email],  # ✅ هون بصير الإرسال لأي إيميل المستخدم
+        "to": [to_email],
         "subject": subject,
         "html": html,
     }
     if text:
         payload["text"] = text
     if EMAIL_REPLY_TO:
-        payload["reply_to"] = EMAIL_REPLY_TO  # ✅ فقط reply-to
+        payload["reply_to"] = EMAIL_REPLY_TO  # اختياري
 
     try:
         result = resend.Emails.send(payload)
@@ -206,6 +213,7 @@ def send_reset_code(email: str, code: str):
     text = f"Nawras password reset code: {code} (valid 10 minutes)"
     send_email(email, subject, html, text)
 
+# ====== Supabase REST helpers ======
 def sb_headers(return_representation: bool = False):
     h = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -433,7 +441,6 @@ async def login(payload: LoginIn, resp: Response):
     token = make_jwt(u["id_uuid"])
     set_auth_cookie(resp, token)
 
-    # ✅ مهم للفرونت عشان يحفظ user_id ويشتغل الشات
     return {"ok": True, "user_id": u["id_uuid"], "name": u.get("name") or "", "email": u.get("email") or ""}
 
 @app.post("/api/logout")
@@ -452,3 +459,47 @@ async def me(req: Request):
     if not profile:
         raise HTTPException(status_code=404, detail="User not found")
     return profile[0]
+
+# =========================
+# ✅ Chat + History (needed by /questions page)
+# =========================
+
+@app.get("/api/history_db")
+async def history_db(user_id: str, session_id: str | None = None):
+    params = {
+        "select": "id,role,content,ts,session_id,source",
+        "user_id": f"eq.{user_id}",
+        "order": "ts.asc",
+        "limit": 400,
+    }
+    if session_id:
+        params["session_id"] = f"eq.{session_id}"
+
+    rows = await sb_get("wizard_sessions", params)
+    return rows
+
+@app.post("/api/chat")
+async def chat(payload: ChatIn):
+    sid = payload.session_id or str(uuid.uuid4())
+
+    # ✅ هنا لاحقاً تربطي RAG الحقيقي
+    answer = f"وصلني سؤالك: {payload.question}\n(جاري ربط الإجابة الذكية لاحقاً)."
+
+    if payload.log_history:
+        await sb_post("wizard_sessions", {
+            "user_id": payload.user_id,
+            "session_id": sid,
+            "role": "user",
+            "content": payload.question,
+            "source": payload.source or "questions_page",
+        }, return_rep=False)
+
+        await sb_post("wizard_sessions", {
+            "user_id": payload.user_id,
+            "session_id": sid,
+            "role": "assistant",
+            "content": answer,
+            "source": payload.source or "questions_page",
+        }, return_rep=False)
+
+    return {"ok": True, "session_id": sid, "answer": answer}
