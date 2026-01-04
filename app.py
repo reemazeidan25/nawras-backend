@@ -7,7 +7,7 @@ import os, bcrypt, jwt, secrets, hashlib, uuid
 import httpx
 from dotenv import load_dotenv
 
-# ✅ Resend
+# Resend
 import resend
 from typing import Optional
 
@@ -22,11 +22,10 @@ JWT_ALG = "HS256"
 JWT_EXPIRES_DAYS = 14
 
 FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN", "") or "").strip()
-
 ENV = (os.getenv("ENV", "production") or "production").strip().lower()
 IS_PROD = ENV == "production"
 
-# ✅ Resend env
+# Resend env
 RESEND_API_KEY = (os.getenv("RESEND_API_KEY", "") or "").strip()
 EMAIL_FROM = (os.getenv("EMAIL_FROM", "") or "").strip()
 EMAIL_REPLY_TO = (os.getenv("EMAIL_REPLY_TO", "") or "").strip()
@@ -108,7 +107,6 @@ class ResetPasswordIn(BaseModel):
 # ====== Helpers ======
 def require_gmail(email: str):
     e = (email or "").strip().lower()
-    # allow only gmail.com
     if not e.endswith("@gmail.com"):
         raise HTTPException(
             status_code=400,
@@ -121,12 +119,13 @@ def make_jwt(user_id_uuid: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def set_auth_cookie(resp: Response, token: str):
+    # IMPORTANT: secure + samesite rules differ between local/prod
     resp.set_cookie(
         key="nawras_token",
         value=token,
         httponly=True,
-        secure=True,
-        samesite="none",
+        secure=True if IS_PROD else False,
+        samesite="none" if IS_PROD else "lax",
         max_age=JWT_EXPIRES_DAYS * 24 * 3600,
         path="/",
     )
@@ -147,7 +146,7 @@ def get_user_from_cookie(req: Request) -> str:
 def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
-# ✅ Resend sender
+# Resend senders
 def send_email(to_email: str, subject: str, html: str, text: Optional[str] = None):
     if not RESEND_API_KEY or not EMAIL_FROM:
         raise HTTPException(
@@ -157,14 +156,14 @@ def send_email(to_email: str, subject: str, html: str, text: Optional[str] = Non
 
     payload = {
         "from": EMAIL_FROM,
-        "to": [to_email],
+        "to": [to_email],  # ✅ هون بصير الإرسال لأي إيميل المستخدم
         "subject": subject,
         "html": html,
     }
     if text:
         payload["text"] = text
     if EMAIL_REPLY_TO:
-        payload["reply_to"] = EMAIL_REPLY_TO
+        payload["reply_to"] = EMAIL_REPLY_TO  # ✅ فقط reply-to
 
     try:
         result = resend.Emails.send(payload)
@@ -284,7 +283,7 @@ async def register(payload: RegisterIn):
 
     pw_hash = bcrypt.hashpw(
         payload.password.encode("utf-8"),
-        bcrypt.gensalt(rounds=10 if not IS_PROD else 12)
+        bcrypt.gensalt(rounds=12 if IS_PROD else 10)
     ).decode("utf-8")
 
     new_uuid = str(uuid.uuid4())
@@ -403,7 +402,7 @@ async def reset_password(payload: ResetPasswordIn):
 
     pw_hash = bcrypt.hashpw(
         new_password.encode("utf-8"),
-        bcrypt.gensalt(rounds=10 if not IS_PROD else 12)
+        bcrypt.gensalt(rounds=12 if IS_PROD else 10)
     ).decode("utf-8")
 
     await sb_patch("users", {"password_hash": pw_hash}, {"email": f"eq.{email}"})
@@ -415,7 +414,10 @@ async def login(payload: LoginIn, resp: Response):
     email = payload.email.strip().lower()
     require_gmail(email)
 
-    user = await sb_get("users", {"select": "id_uuid,password_hash,is_verified", "email": f"eq.{email}", "limit": 1})
+    user = await sb_get(
+        "users",
+        {"select": "id_uuid,name,email,password_hash,is_verified", "email": f"eq.{email}", "limit": 1},
+    )
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
@@ -426,12 +428,13 @@ async def login(payload: LoginIn, resp: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if u.get("is_verified") is not True:
-        # خليها واضحة للفرونت
         raise HTTPException(status_code=403, detail={"code": "EMAIL_NOT_VERIFIED", "message": "Email not verified"})
 
     token = make_jwt(u["id_uuid"])
     set_auth_cookie(resp, token)
-    return {"ok": True}
+
+    # ✅ مهم للفرونت عشان يحفظ user_id ويشتغل الشات
+    return {"ok": True, "user_id": u["id_uuid"], "name": u.get("name") or "", "email": u.get("email") or ""}
 
 @app.post("/api/logout")
 def logout(resp: Response):
