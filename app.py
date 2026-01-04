@@ -106,6 +106,15 @@ class ResetPasswordIn(BaseModel):
     new_password: str
 
 # ====== Helpers ======
+def require_gmail(email: str):
+    e = (email or "").strip().lower()
+    # allow only gmail.com
+    if not e.endswith("@gmail.com"):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "ONLY_GMAIL_ALLOWED", "message": "Only Gmail accounts are allowed"}
+        )
+
 def make_jwt(user_id_uuid: str) -> str:
     exp = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRES_DAYS)
     payload = {"sub": user_id_uuid, "exp": exp}
@@ -163,7 +172,6 @@ def send_email(to_email: str, subject: str, html: str, text: Optional[str] = Non
     except Exception as e:
         print(f"❌ Failed to send email to {to_email}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
-
 
 def send_email_code(email: str, code: str):
     subject = "Nawras | كود تفعيل الحساب"
@@ -260,6 +268,7 @@ def health():
 @app.post("/api/register")
 async def register(payload: RegisterIn):
     email = payload.email.strip().lower()
+    require_gmail(email)
 
     existing = await sb_get("users", {"select": "id_uuid,is_verified", "email": f"eq.{email}", "limit": 1})
     if existing:
@@ -300,6 +309,7 @@ async def register(payload: RegisterIn):
 @app.post("/api/auth/request_email_code")
 async def request_email_code(payload: EmailIn):
     email = payload.email.strip().lower()
+    require_gmail(email)
 
     user = await sb_get("users", {"select": "id_uuid,is_verified", "email": f"eq.{email}", "limit": 1})
     if not user:
@@ -324,6 +334,7 @@ async def request_email_code(payload: EmailIn):
 @app.post("/api/auth/verify_email_code")
 async def verify_email_code(payload: VerifyCodeIn):
     email = payload.email.strip().lower()
+    require_gmail(email)
     code = payload.code.strip()
 
     row = await sb_get("email_verifications", {"select": "*", "email": f"eq.{email}", "limit": 1})
@@ -347,6 +358,7 @@ async def verify_email_code(payload: VerifyCodeIn):
 @app.post("/api/auth/request_password_reset")
 async def request_password_reset(payload: ResetRequestIn):
     email = payload.email.strip().lower()
+    require_gmail(email)
 
     user = await sb_get("users", {"select": "id_uuid", "email": f"eq.{email}", "limit": 1})
     if not user:
@@ -369,6 +381,7 @@ async def request_password_reset(payload: ResetRequestIn):
 @app.post("/api/auth/reset_password")
 async def reset_password(payload: ResetPasswordIn):
     email = payload.email.strip().lower()
+    require_gmail(email)
     code = payload.code.strip()
     new_password = payload.new_password
 
@@ -400,6 +413,7 @@ async def reset_password(payload: ResetPasswordIn):
 @app.post("/api/login")
 async def login(payload: LoginIn, resp: Response):
     email = payload.email.strip().lower()
+    require_gmail(email)
 
     user = await sb_get("users", {"select": "id_uuid,password_hash,is_verified", "email": f"eq.{email}", "limit": 1})
     if not user:
@@ -412,6 +426,7 @@ async def login(payload: LoginIn, resp: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if u.get("is_verified") is not True:
+        # خليها واضحة للفرونت
         raise HTTPException(status_code=403, detail={"code": "EMAIL_NOT_VERIFIED", "message": "Email not verified"})
 
     token = make_jwt(u["id_uuid"])
